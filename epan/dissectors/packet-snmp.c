@@ -85,6 +85,11 @@
 #define TCP_PORT_SMUX		199
 #define UDP_PORT_SNMP_PATROL 8161
 
+#define HASH_SHA2_224_LENGTH 28
+#define HASH_SHA2_256_LENGTH 32
+#define HASH_SHA2_384_LENGTH 48
+#define HASH_SHA2_512_LENGTH 64
+
 /* Initialize the protocol and registered fields */
 static int proto_snmp = -1;
 static int proto_smux = -1;
@@ -97,28 +102,52 @@ void proto_reg_handoff_snmp(void);
 void proto_register_smux(void);
 void proto_reg_handoff_smux(void);
 
-static gboolean snmp_usm_auth_md5(snmp_usm_params_t* p, guint8**, guint*, gchar const**);
-static gboolean snmp_usm_auth_sha1(snmp_usm_params_t* p, guint8**, guint*, gchar const**);
+static void snmp_usm_password_to_key(const snmp_usm_auth_model_t model, const guint8 *password, guint passwordlen,
+        const guint8 *engineID, guint engineLength, guint8 *key);
 
 static tvbuff_t* snmp_usm_priv_des(snmp_usm_params_t*, tvbuff_t*, packet_info *pinfo, gchar const**);
 static tvbuff_t* snmp_usm_priv_aes128(snmp_usm_params_t*, tvbuff_t*, packet_info *pinfo, gchar const**);
 static tvbuff_t* snmp_usm_priv_aes192(snmp_usm_params_t*, tvbuff_t*, packet_info *pinfo, gchar const**);
 static tvbuff_t* snmp_usm_priv_aes256(snmp_usm_params_t*, tvbuff_t*, packet_info *pinfo, gchar const**);
 
-
-static void snmp_usm_password_to_key_md5(const guint8 *password, guint passwordlen, const guint8 *engineID, guint engineLength, guint8 *key);
-static void snmp_usm_password_to_key_sha1(const guint8 *password, guint passwordlen, const guint8 *engineID, guint engineLength, guint8 *key);
-
-
-static snmp_usm_auth_model_t model_md5 = {snmp_usm_password_to_key_md5, snmp_usm_auth_md5, 16};
-static snmp_usm_auth_model_t model_sha1 = {snmp_usm_password_to_key_sha1, snmp_usm_auth_sha1, 20};
+static gboolean snmp_usm_auth(const snmp_usm_auth_model_t model, snmp_usm_params_t* p, guint8**, guint*, gchar const**);
 
 static const value_string auth_types[] = {
-	{0,"MD5"},
-	{1,"SHA1"},
+	{SNMP_USM_AUTH_MD5,"MD5"},
+	{SNMP_USM_AUTH_SHA1,"SHA1"},
+	{SNMP_USM_AUTH_SHA2_224,"SHA2-224"},
+	{SNMP_USM_AUTH_SHA2_256,"SHA2-256"},
+	{SNMP_USM_AUTH_SHA2_384,"SHA2-384"},
+	{SNMP_USM_AUTH_SHA2_512,"SHA2-512"},
 	{0,NULL}
 };
-static snmp_usm_auth_model_t* auth_models[] = {&model_md5,&model_sha1};
+
+static const guint auth_hash_len[] = {
+    [SNMP_USM_AUTH_MD5] = HASH_MD5_LENGTH,
+    [SNMP_USM_AUTH_SHA1] = HASH_SHA1_LENGTH,
+    [SNMP_USM_AUTH_SHA2_224] = HASH_SHA2_224_LENGTH,
+    [SNMP_USM_AUTH_SHA2_256] = HASH_SHA2_256_LENGTH,
+    [SNMP_USM_AUTH_SHA2_384] = HASH_SHA2_384_LENGTH,
+    [SNMP_USM_AUTH_SHA2_512] = HASH_SHA2_512_LENGTH
+};
+
+static const guint auth_tag_len[] = {
+    [SNMP_USM_AUTH_MD5] = 12,
+    [SNMP_USM_AUTH_SHA1] = 12,
+    [SNMP_USM_AUTH_SHA2_224] = 16,
+    [SNMP_USM_AUTH_SHA2_256] = 24,
+    [SNMP_USM_AUTH_SHA2_384] = 32,
+    [SNMP_USM_AUTH_SHA2_512] = 48
+};
+
+static const enum gcry_md_algos auth_hash_algo[] = {
+    [SNMP_USM_AUTH_MD5] = GCRY_MD_MD5,
+    [SNMP_USM_AUTH_SHA1] = GCRY_MD_SHA1,
+    [SNMP_USM_AUTH_SHA2_224] = GCRY_MD_SHA224,
+    [SNMP_USM_AUTH_SHA2_256] = GCRY_MD_SHA256,
+    [SNMP_USM_AUTH_SHA2_384] = GCRY_MD_SHA384,
+    [SNMP_USM_AUTH_SHA2_512] = GCRY_MD_SHA512
+};
 
 #define PRIV_DES	0
 #define PRIV_AES128	1
@@ -291,7 +320,7 @@ static int hf_snmp_priority = -1;                 /* INTEGER_M1_2147483647 */
 static int hf_snmp_operation = -1;                /* T_operation */
 
 /*--- End of included file: packet-snmp-hf.c ---*/
-#line 217 "./asn1/snmp/packet-snmp-template.c"
+#line 246 "./asn1/snmp/packet-snmp-template.c"
 
 /* Initialize the subtree pointers */
 static gint ett_smux = -1;
@@ -331,7 +360,7 @@ static gint ett_snmp_SimpleOpen_U = -1;
 static gint ett_snmp_RReqPDU_U = -1;
 
 /*--- End of included file: packet-snmp-ett.c ---*/
-#line 233 "./asn1/snmp/packet-snmp-template.c"
+#line 262 "./asn1/snmp/packet-snmp-template.c"
 
 static expert_field ei_snmp_failed_decrypted_data_pdu = EI_INIT;
 static expert_field ei_snmp_decrypted_data_bad_formatted = EI_INIT;
@@ -1327,11 +1356,12 @@ dissect_snmp_engineid(proto_tree *tree, packet_info *pinfo, tvbuff_t *tvb, int o
 
 
 static void set_ue_keys(snmp_ue_assoc_t* n ) {
-	guint key_size = n->user.authModel->key_size;
+	guint key_size = auth_hash_len[n->user.authModel];
 
 	n->user.authKey.data = (guint8 *)g_malloc(key_size);
 	n->user.authKey.len = key_size;
-	n->user.authModel->pass2key(n->user.authPassword.data,
+	snmp_usm_password_to_key(n->user.authModel,
+                    n->user.authPassword.data,
 				    n->user.authPassword.len,
 				    n->engine.data,
 				    n->engine.len,
@@ -1352,7 +1382,8 @@ static void set_ue_keys(snmp_ue_assoc_t* n ) {
 		n->user.privKey.data = (guint8 *)g_malloc(key_len);
 		n->user.privKey.len  = need_key_len;
 
-		n->user.authModel->pass2key(n->user.privPassword.data,
+		snmp_usm_password_to_key(n->user.authModel,
+		                n->user.privPassword.data,
 					    n->user.privPassword.len,
 					    n->engine.data,
 					    n->engine.len,
@@ -1362,7 +1393,7 @@ static void set_ue_keys(snmp_ue_assoc_t* n ) {
 
 		/* extend key if needed */
 		while (key_len < need_key_len) {
-			n->user.authModel->pass2key(
+		    snmp_usm_password_to_key(n->user.authModel,
 				n->user.privKey.data,
 				key_len,
 				n->engine.data,
@@ -1375,7 +1406,8 @@ static void set_ue_keys(snmp_ue_assoc_t* n ) {
 	} else {
 		n->user.privKey.data = (guint8 *)g_malloc(key_size);
 		n->user.privKey.len = key_size;
-		n->user.authModel->pass2key(n->user.privPassword.data,
+		snmp_usm_password_to_key(n->user.authModel,
+                        n->user.privPassword.data,
 					    n->user.privPassword.len,
 					    n->engine.data,
 					    n->engine.len,
@@ -1419,7 +1451,7 @@ snmp_users_copy_cb(void* dest, const void* orig, size_t len _U_)
 	snmp_ue_assoc_t* d = (snmp_ue_assoc_t*)dest;
 
 	d->auth_model = o->auth_model;
-	d->user.authModel = auth_models[o->auth_model];
+	d->user.authModel = (snmp_usm_auth_model_t) o->auth_model;
 
 	d->priv_proto = o->priv_proto;
 	d->user.privProtocol = priv_protos[o->priv_proto];
@@ -1622,134 +1654,67 @@ get_user_assoc(tvbuff_t* engine_tvb, tvbuff_t* user_tvb)
 }
 
 static gboolean
-snmp_usm_auth_md5(snmp_usm_params_t* p, guint8** calc_auth_p, guint* calc_auth_len_p, gchar const** error)
+snmp_usm_auth(const snmp_usm_auth_model_t model, snmp_usm_params_t* p, guint8** calc_auth_p,
+        guint* calc_auth_len_p, gchar const** error)
 {
-	gint msg_len;
-	guint8* msg;
-	guint auth_len;
-	guint8* auth;
-	guint8* key;
-	guint key_len;
-	guint8 *calc_auth;
-	guint start;
-	guint end;
-	guint i;
+    gint msg_len;
+    guint8* msg;
+    guint auth_len;
+    guint8* auth;
+    guint8* key;
+    guint key_len;
+    guint8 *calc_auth;
+    guint start;
+    guint end;
+    guint i;
 
-	if (!p->auth_tvb) {
-		*error = "No Authenticator";
-		return FALSE;
-	}
+    if (!p->auth_tvb) {
+            *error = "No Authenticator";
+            return FALSE;
+    }
 
-	key = p->user_assoc->user.authKey.data;
-	key_len = p->user_assoc->user.authKey.len;
+    key = p->user_assoc->user.authKey.data;
+    key_len = p->user_assoc->user.authKey.len;
 
-	if (! key ) {
-		*error = "User has no authKey";
-		return FALSE;
-	}
+    if (! key ) {
+            *error = "User has no authKey";
+            return FALSE;
+    }
 
+    auth_len = tvb_captured_length(p->auth_tvb);
 
-	auth_len = tvb_captured_length(p->auth_tvb);
+    if (auth_len != auth_tag_len[model]) {
+            *error = "Authenticator length wrong";
+            return FALSE;
+    }
 
-	if (auth_len != 12) {
-		*error = "Authenticator length wrong";
-		return FALSE;
-	}
+    msg_len = tvb_captured_length(p->msg_tvb);
+    if (msg_len <= 0) {
+            *error = "Not enough data remaining";
+            return FALSE;
+    }
+    msg = (guint8*)tvb_memdup(wmem_packet_scope(),p->msg_tvb,0,msg_len);
 
-	msg_len = tvb_captured_length(p->msg_tvb);
-	if (msg_len <= 0) {
-		*error = "Not enough data remaining";
-		return FALSE;
-	}
-	msg = (guint8*)tvb_memdup(wmem_packet_scope(),p->msg_tvb,0,msg_len);
+    auth = (guint8*)tvb_memdup(wmem_packet_scope(),p->auth_tvb,0,auth_len);
 
+    start = p->auth_offset - p->start_offset;
+    end =   start + auth_len;
 
-	auth = (guint8*)tvb_memdup(wmem_packet_scope(),p->auth_tvb,0,auth_len);
+    /* fill the authenticator with zeros */
+    for ( i = start ; i < end ; i++ ) {
+            msg[i] = '\0';
+    }
 
-	start = p->auth_offset - p->start_offset;
-	end = 	start + auth_len;
+    calc_auth = (guint8*)wmem_alloc(wmem_packet_scope(), auth_hash_len[model]);
 
-	/* fill the authenticator with zeros */
-	for ( i = start ; i < end ; i++ ) {
-		msg[i] = '\0';
-	}
+    if (ws_hmac_buffer(auth_hash_algo[model], calc_auth, msg, msg_len, key, key_len)) {
+            return FALSE;
+    }
 
-	calc_auth = (guint8*)wmem_alloc(wmem_packet_scope(), HASH_MD5_LENGTH);
+    if (calc_auth_p) *calc_auth_p = calc_auth;
+    if (calc_auth_len_p) *calc_auth_len_p = auth_len;
 
-	if (ws_hmac_buffer(GCRY_MD_MD5, calc_auth, msg, msg_len, key, key_len)) {
-		return FALSE;
-	}
-
-	if (calc_auth_p) *calc_auth_p = calc_auth;
-	if (calc_auth_len_p) *calc_auth_len_p = 12;
-
-	return ( memcmp(auth,calc_auth,12) != 0 ) ? FALSE : TRUE;
-}
-
-
-static gboolean
-snmp_usm_auth_sha1(snmp_usm_params_t* p _U_, guint8** calc_auth_p, guint* calc_auth_len_p, gchar const** error _U_)
-{
-	gint msg_len;
-	guint8* msg;
-	guint auth_len;
-	guint8* auth;
-	guint8* key;
-	guint key_len;
-	guint8 *calc_auth;
-	guint start;
-	guint end;
-	guint i;
-
-	if (!p->auth_tvb) {
-		*error = "No Authenticator";
-		return FALSE;
-	}
-
-	key = p->user_assoc->user.authKey.data;
-	key_len = p->user_assoc->user.authKey.len;
-
-	if (! key ) {
-		*error = "User has no authKey";
-		return FALSE;
-	}
-
-
-	auth_len = tvb_captured_length(p->auth_tvb);
-
-
-	if (auth_len != 12) {
-		*error = "Authenticator length wrong";
-		return FALSE;
-	}
-
-	msg_len = tvb_captured_length(p->msg_tvb);
-	if (msg_len <= 0) {
-		*error = "Not enough data remaining";
-		return FALSE;
-	}
-	msg = (guint8*)tvb_memdup(wmem_packet_scope(),p->msg_tvb,0,msg_len);
-
-	auth = (guint8*)tvb_memdup(wmem_packet_scope(),p->auth_tvb,0,auth_len);
-
-	start = p->auth_offset - p->start_offset;
-	end = 	start + auth_len;
-
-	/* fill the authenticator with zeros */
-	for ( i = start ; i < end ; i++ ) {
-		msg[i] = '\0';
-	}
-
-	calc_auth = (guint8*)wmem_alloc(wmem_packet_scope(), HASH_SHA1_LENGTH);
-
-	if (ws_hmac_buffer(GCRY_MD_SHA1, calc_auth, msg, msg_len, key, key_len)) {
-		return FALSE;
-	}
-
-	if (calc_auth_p) *calc_auth_p = calc_auth;
-	if (calc_auth_len_p) *calc_auth_len_p = 12;
-
-	return ( memcmp(auth,calc_auth,12) != 0 ) ? FALSE : TRUE;
+    return ( memcmp(auth,calc_auth,auth_len) != 0 ) ? FALSE : TRUE;
 }
 
 static tvbuff_t*
@@ -2742,10 +2707,10 @@ dissect_snmp_SNMPv3Message(gboolean implicit_tag _U_, tvbuff_t *tvb _U_, int off
 		const gchar* error = NULL;
 		proto_item* authen_item;
 		proto_tree* authen_tree = proto_item_add_subtree(usm_p.auth_item,ett_authParameters);
-		guint8* calc_auth;
-		guint calc_auth_len;
+		guint8* calc_auth = NULL;
+		guint calc_auth_len = 0;
 
-		usm_p.authOK = usm_p.user_assoc->user.authModel->authenticate( &usm_p, &calc_auth, &calc_auth_len, &error );
+		usm_p.authOK = snmp_usm_auth(usm_p.user_assoc->user.authModel, &usm_p, &calc_auth, &calc_auth_len, &error );
 
 		if (error) {
 			expert_add_info_format( actx->pinfo, usm_p.auth_item, &ei_snmp_verify_authentication_error, "Error while verifying Message authenticity: %s", error );
@@ -3048,7 +3013,7 @@ static int dissect_SMUX_PDUs_PDU(tvbuff_t *tvb _U_, packet_info *pinfo _U_, prot
 
 
 /*--- End of included file: packet-snmp-fn.c ---*/
-#line 1843 "./asn1/snmp/packet-snmp-template.c"
+#line 1808 "./asn1/snmp/packet-snmp-template.c"
 
 
 guint
@@ -3331,126 +3296,65 @@ dissect_smux(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
 	return dissect_SMUX_PDUs_PDU(tvb, pinfo, smux_tree, data);
 }
 
-
 /*
-  MD5 Password to Key Algorithm
-  from RFC 3414 A.2.1
+  MD5 Password to Key Algorithm from RFC 3414 A.2.1
+  SHA1 Password to Key Algorithm from RFC 3414 A.2.2
+  SHA2 Password to Key Algorithm from RFC 7860 9.3
 */
 static void
-snmp_usm_password_to_key_md5(const guint8 *password, guint passwordlen,
-			     const guint8 *engineID, guint engineLength,
-			     guint8 *key)
+snmp_usm_password_to_key(const snmp_usm_auth_model_t model, const guint8 *password,
+        guint passwordlen, const guint8 *engineID, guint engineLength, guint8 *key)
 {
-	guint8		*cp, password_buf[64];
-	guint32		password_index = 0;
-	guint32		count = 0, i;
-	guint8		key1[16];
-	gcry_md_hd_t	md5_handle;
-	if (gcry_md_open(&md5_handle, GCRY_MD_MD5, 0)) {
-		return;
-	}
+    gcry_md_hd_t    hash_handle;
+    guint8      *cp, password_buf[64];
+    guint32     password_index = 0;
+    guint32     count = 0, i;
+    guint       hash_len;
 
-	/**********************************************/
-	/* Use while loop until we've done 1 Megabyte */
-	/**********************************************/
-	while (count < 1048576) {
-		cp = password_buf;
-		if (passwordlen != 0) {
-			for (i = 0; i < 64; i++) {
-				/*************************************************/
-				/* Take the next octet of the password, wrapping */
-				/* to the beginning of the password as necessary.*/
-				/*************************************************/
-				*cp++ = password[password_index++ % passwordlen];
-			}
-		} else {
-			*cp = 0;
-		}
-		gcry_md_write(md5_handle, password_buf, 64);
-		count += 64;
-	}
-	memcpy(key1, gcry_md_read(md5_handle, 0), HASH_MD5_LENGTH);
-	gcry_md_close(md5_handle);
+    if (gcry_md_open(&hash_handle, auth_hash_algo[model], 0)) {
+        return;
+    }
 
-	/*****************************************************/
-	/* Now localize the key with the engineID and pass   */
-	/* through MD5 to produce final key                  */
-	/* We ignore invalid engineLengths here. More strict */
-	/* checking is done in snmp_users_update_cb.         */
-	/*****************************************************/
+    hash_len = auth_hash_len[model];
 
-	if (gcry_md_open(&md5_handle, GCRY_MD_MD5, 0)) {
-		return;
-	}
-	gcry_md_write(md5_handle, key1, HASH_MD5_LENGTH);
-	gcry_md_write(md5_handle, engineID, engineLength);
-	gcry_md_write(md5_handle, key1, HASH_MD5_LENGTH);
-	memcpy(key, gcry_md_read(md5_handle, 0), HASH_MD5_LENGTH);
-	gcry_md_close(md5_handle);
+    /**********************************************/
+    /* Use while loop until we've done 1 Megabyte */
+    /**********************************************/
+    while (count < 1048576) {
+        cp = password_buf;
+        if (passwordlen != 0) {
+            for (i = 0; i < 64; i++) {
+                /*************************************************/
+                /* Take the next octet of the password, wrapping */
+                /* to the beginning of the password as necessary.*/
+                /*************************************************/
+                *cp++ = password[password_index++ % passwordlen];
+            }
+        } else {
+            *cp = 0;
+        }
+        gcry_md_write(hash_handle, password_buf, 64);
+        count += 64;
+    }
+    memcpy(key, gcry_md_read(hash_handle, 0), hash_len);
+    gcry_md_close(hash_handle);
 
-	return;
+    /*****************************************************/
+    /* Now localise the key with the engineID and pass   */
+    /* through hash function to produce final key        */
+    /* We ignore invalid engineLengths here. More strict */
+    /* checking is done in snmp_users_update_cb.         */
+    /*****************************************************/
+    if (gcry_md_open(&hash_handle, auth_hash_algo[model], 0)) {
+        return;
+    }
+    gcry_md_write(hash_handle, key, hash_len);
+    gcry_md_write(hash_handle, engineID, engineLength);
+    gcry_md_write(hash_handle, key, hash_len);
+    memcpy(key, gcry_md_read(hash_handle, 0), hash_len);
+    gcry_md_close(hash_handle);
+    return;
 }
-
-
-
-
-/*
-   SHA1 Password to Key Algorithm COPIED from RFC 3414 A.2.2
- */
-
-static void
-snmp_usm_password_to_key_sha1(const guint8 *password, guint passwordlen,
-			      const guint8 *engineID, guint engineLength,
-			      guint8 *key)
-{
-	gcry_md_hd_t	sha1_handle;
-	guint8		*cp, password_buf[64];
-	guint32		password_index = 0;
-	guint32		count = 0, i;
-
-	if (gcry_md_open(&sha1_handle, GCRY_MD_SHA1, 0)) {
-		return;
-	}
-
-	/**********************************************/
-	/* Use while loop until we've done 1 Megabyte */
-	/**********************************************/
-	while (count < 1048576) {
-		cp = password_buf;
-		if (passwordlen != 0) {
-			for (i = 0; i < 64; i++) {
-				/*************************************************/
-				/* Take the next octet of the password, wrapping */
-				/* to the beginning of the password as necessary.*/
-				/*************************************************/
-				*cp++ = password[password_index++ % passwordlen];
-			}
-		} else {
-			*cp = 0;
-		}
-		gcry_md_write(sha1_handle, password_buf, 64);
-		count += 64;
-	}
-	memcpy(key, gcry_md_read(sha1_handle, 0), HASH_SHA1_LENGTH);
-	gcry_md_close(sha1_handle);
-
-	/*****************************************************/
-	/* Now localize the key with the engineID and pass   */
-	/* through SHA to produce final key                  */
-	/* We ignore invalid engineLengths here. More strict */
-	/* checking is done in snmp_users_update_cb.         */
-	/*****************************************************/
-	if (gcry_md_open(&sha1_handle, GCRY_MD_SHA1, 0)) {
-		return;
-	}
-	gcry_md_write(sha1_handle, key, HASH_SHA1_LENGTH);
-	gcry_md_write(sha1_handle, engineID, engineLength);
-	gcry_md_write(sha1_handle, key, HASH_SHA1_LENGTH);
-	memcpy(key, gcry_md_read(sha1_handle, 0), HASH_SHA1_LENGTH);
-	gcry_md_close(sha1_handle);
-	return;
- }
-
 
 static void
 process_prefs(void)
@@ -3508,7 +3412,7 @@ void proto_register_snmp(void) {
 		    TFS(&tfs_snmp_engineid_conform), F_SNMP_ENGINEID_CONFORM, "Engine ID RFC3411 Conformance", HFILL }},
 		{ &hf_snmp_engineid_enterprise, {
 		    "Engine Enterprise ID", "snmp.engineid.enterprise", FT_UINT32, BASE_ENTERPRISES,
-                    STRINGS_ENTERPRISES, 0, NULL, HFILL }},
+		    STRINGS_ENTERPRISES, 0, NULL, HFILL }},
 		{ &hf_snmp_engineid_format, {
 		    "Engine ID Format", "snmp.engineid.format", FT_UINT8, BASE_DEC,
 		    VALS(snmp_engineid_format_vals), 0, NULL, HFILL }},
@@ -3876,7 +3780,7 @@ void proto_register_snmp(void) {
         NULL, HFILL }},
 
 /*--- End of included file: packet-snmp-hfarr.c ---*/
-#line 2406 "./asn1/snmp/packet-snmp-template.c"
+#line 2310 "./asn1/snmp/packet-snmp-template.c"
 	};
 
 	/* List of subtrees */
@@ -3916,7 +3820,7 @@ void proto_register_snmp(void) {
     &ett_snmp_RReqPDU_U,
 
 /*--- End of included file: packet-snmp-ettarr.c ---*/
-#line 2422 "./asn1/snmp/packet-snmp-template.c"
+#line 2326 "./asn1/snmp/packet-snmp-template.c"
 	};
 	static ei_register_info ei[] = {
 		{ &ei_snmp_failed_decrypted_data_pdu, { "snmp.failed_decrypted_data_pdu", PI_MALFORMED, PI_WARN, "Failed to decrypt encryptedPDU", EXPFILL }},
